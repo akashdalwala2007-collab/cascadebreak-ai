@@ -19,11 +19,33 @@ Demonstration Weights (Configurable):
 """
 
 import copy
+import itertools
+import math
 from typing import Dict, List, Tuple, Any, Optional
 import pandas as pd
 import networkx as nx
 
-from cascade_engine import CascadeEngine
+from cascade_engine import CascadeEngine, is_road_impassable, is_road_passable
+
+
+def _is_safe_finite_numeric(val: Any) -> bool:
+    """
+    Safely checks if a value is a finite number (int or float).
+    Rejects booleans (isinstance(True, int) is True in Python), NaN, +/-inf,
+    and arbitrarily large integers that would cause OverflowError on float conversion.
+    """
+    if isinstance(val, bool):
+        return False
+    if isinstance(val, int):
+        if val.bit_length() > 1024:
+            return False
+        try:
+            return math.isfinite(float(val))
+        except (OverflowError, ValueError):
+            return False
+    if isinstance(val, float):
+        return math.isfinite(val)
+    return False
 
 
 class InterventionEngine:
@@ -31,6 +53,8 @@ class InterventionEngine:
     Evaluates candidate interventions against an immutable flooded baseline,
     computes Utility, ranks strategies, and compares against heuristic baselines.
     """
+
+    _is_safe_finite_numeric = staticmethod(_is_safe_finite_numeric)
 
     def __init__(self, cascade_engine: CascadeEngine):
         self.ce = cascade_engine
@@ -44,7 +68,7 @@ class InterventionEngine:
           2. Temporary Access (standard strategic emergency pontoons/bypasses)
           3. Combined Interventions (curated pairs of complementary actions)
         """
-        flooded_roads = [r for r in self.roads if r.get("is_flooded", False)]
+        flooded_roads = sorted([r for r in self.roads if is_road_impassable(r)], key=lambda r: r["road_id"])
         candidates = []
 
         # Type 1: Single Road Restorations
@@ -104,20 +128,45 @@ class InterventionEngine:
         candidates.extend(temp_options)
 
         # Type 3: Combined Interventions (Bundles of 2 complementary actions)
+        # Select strategic pairs using deterministic semantic criteria independent of road list ordering
         if len(flooded_roads) >= 2:
-            # Pair the top-2 most strategic flooded roads or bridge combos
-            r_pairs = []
-            for i in range(len(flooded_roads)):
-                for j in range(i + 1, len(flooded_roads)):
-                    r_pairs.append((flooded_roads[i], flooded_roads[j]))
-                    if len(r_pairs) >= 3:  # Keep combinatorial search small for MVP
-                        break
-                if len(r_pairs) >= 3:
-                    break
+            fac_nodes = set(self.ce.hospital_nodes + self.ce.relief_nodes)
+            candidate_pairs = []
+            for r_a, r_b in itertools.combinations(flooded_roads, 2):
+                # Canonical ordering within each pair by road_id
+                r1, r2 = sorted([r_a, r_b], key=lambda r: r["road_id"])
 
-            for r1, r2 in r_pairs:
+                # Deterministic semantic priority criteria:
+                # 1. Corridor continuity: roads that share an intersection form a connected corridor
+                is_adjacent = bool({r1["u"], r1["v"]} & {r2["u"], r2["v"]})
+                # 2. Critical facility connectivity: connects directly to hospital or relief centre
+                connects_facility = bool({r1["u"], r1["v"], r2["u"], r2["v"]} & fac_nodes)
+                # 3. Population exposure: total population across distinct endpoints
+                pop_weight = sum(self.nodes[n].get("population", 0) for n in {r1["u"], r1["v"], r2["u"], r2["v"]})
+                # 4. Logistical feasibility: lower combined effort is preferred
                 combined_effort = round(r1["effort_cost"] + r2["effort_cost"], 1)
-                candidates.append({
+
+                # Priority key:
+                # Priority rank (lower is better):
+                #   is_adjacent (0 vs 1)
+                #   connects_facility (0 vs 1)
+                #   -pop_weight (higher population first)
+                #   combined_effort (lower effort first)
+                #   road_id tie-breaker
+                priority_key = (
+                    0 if is_adjacent else 1,
+                    0 if connects_facility else 1,
+                    -pop_weight,
+                    combined_effort,
+                    r1["road_id"],
+                    r2["road_id"],
+                )
+                candidate_pairs.append((priority_key, r1, r2, combined_effort))
+
+            # Sort deterministically by semantic priority and evaluate all strategic pairs
+            candidate_pairs.sort(key=lambda x: x[0])
+            for _, r1, r2, combined_effort in candidate_pairs:
+                combined_cand = {
                     "id": f"COMBINED_{r1['road_id']}_{r2['road_id']}",
                     "name": f"Dual Restore: {r1['road_id']} + {r2['road_id']}",
                     "type": "Combined Intervention",
@@ -125,27 +174,95 @@ class InterventionEngine:
                     "temporary_links": [],
                     "effort_cost": combined_effort,
                     "description": f"Simultaneous dual-corridor restoration of {r1['road_id']} and {r2['road_id']}.",
-                })
+                }
+                candidates.append(combined_cand)
 
         return candidates
+
+    def validate_candidate(self, candidate: Dict[str, Any]) -> bool:
+        """
+        Defensively validates that a candidate intervention is properly formed,
+        well-typed, and feasible.
+        Rejects malformed candidates cleanly (returns False) without leaking exceptions.
+        """
+        if not isinstance(candidate, dict):
+            return False
+
+        cand_id = candidate.get("id")
+        if not isinstance(cand_id, str) or not cand_id.strip():
+            return False
+
+        if "effort_cost" not in candidate:
+            return False
+        effort = candidate["effort_cost"]
+        if not _is_safe_finite_numeric(effort) or effort <= 0:
+            return False
+
+        target_roads = candidate.get("target_roads", [])
+        temp_links = candidate.get("temporary_links", [])
+
+        # Validate containers are lists, tuples, or sets (not str, dict, int, etc.)
+        if not isinstance(target_roads, (list, tuple, set)):
+            return False
+        if not isinstance(temp_links, (list, tuple, set)):
+            return False
+
+        # Must have at least one restoration road or temporary link
+        if not target_roads and not temp_links:
+            return False
+
+        all_road_ids = {r.get("road_id") for r in self.roads if isinstance(r, dict) and "road_id" in r}
+        for r_id in target_roads:
+            if not isinstance(r_id, str) or not r_id.strip() or r_id not in all_road_ids:
+                return False
+
+        all_node_ids = set(self.nodes.keys())
+        for link in temp_links:
+            if not isinstance(link, dict):
+                return False
+            u = link.get("u")
+            v = link.get("v")
+            if not isinstance(u, str) or not isinstance(v, str):
+                return False
+            if not u.strip() or not v.strip() or u not in all_node_ids or v not in all_node_ids:
+                return False
+            if "effort_cost" in link:
+                link_effort = link["effort_cost"]
+                if not _is_safe_finite_numeric(link_effort) or link_effort < 0:
+                    return False
+            if "length_km" in link:
+                link_len = link["length_km"]
+                if not _is_safe_finite_numeric(link_len) or link_len <= 0:
+                    return False
+
+        return True
 
     def simulate_candidate(self, candidate: Dict[str, Any]) -> Tuple[nx.Graph, Dict[str, Any]]:
         """
         Simulates an intervention candidate non-destructively:
+          - Validates candidate structure
           - Starts from clean baseline flooded graph
-          - Restores specified target roads
+          - Restores specified target roads to passable
           - Adds any temporary links
           - Calculates resulting accessibility metrics
         """
+        if not self.validate_candidate(candidate):
+            raise ValueError(f"Cannot simulate malformed or invalid candidate: {candidate}")
+
         target_roads_set = set(candidate.get("target_roads", []))
         temp_links = candidate.get("temporary_links", [])
 
-        # Clone roads and update target roads to passable
+        # Clone roads and update target roads to passable across all passability indicators
         sim_roads = copy.deepcopy(self.roads)
         for r in sim_roads:
             if r["road_id"] in target_roads_set:
                 r["is_flooded"] = False
                 r["is_accessible"] = True
+                r["is_impassable"] = False
+                r["passable"] = True
+                r["is_passable"] = True
+                if "status" in r and str(r["status"]).lower() in {"impassable", "submerged", "closed", "blocked"}:
+                    r["status"] = "restored"
 
         G_intervened = self.ce._build_graph(
             filter_flooded=True,
@@ -208,7 +325,10 @@ class InterventionEngine:
 
         df = pd.DataFrame(results)
         if not df.empty:
-            df = df.sort_values(by=["utility", "delta_population"], ascending=[False, False]).reset_index(drop=True)
+            df = df.sort_values(
+                by=["utility", "delta_population", "effort", "candidate_id"],
+                ascending=[False, False, True, True]
+            ).reset_index(drop=True)
             df.index = df.index + 1
             df.index.name = "Rank"
 
@@ -307,7 +427,7 @@ class InterventionEngine:
           - Baseline B (Population Exposure First): Responders restore the road directly adjacent to the largest cut-off population cluster.
           - CascadeBreak AI (Proposed): Top-ranked intervention maximizing downstream accessibility utility.
         """
-        flooded_roads = [r for r in self.roads if r.get("is_flooded", False)]
+        flooded_roads = [r for r in self.roads if is_road_impassable(r)]
         if not flooded_roads:
             return pd.DataFrame()
 
@@ -407,36 +527,64 @@ class InterventionEngine:
 
         return pd.DataFrame(comparison_data)
 
-    def get_analysis_reliability(self) -> Dict[str, Any]:
+    def get_analysis_reliability(self, level: Optional[str] = None) -> Dict[str, Any]:
         """
         Evaluates prototype analysis reliability based on data completeness indicators.
         Label: Prototype analysis reliability — not a calibrated probability.
+
+        Measured completeness remains authoritative when determining the effective reliability level.
+        An explicitly supplied level parameter cannot override or falsify data completeness.
         """
         has_nodes = len(self.nodes) >= 10
         has_facilities = len(self.ce.hospital_nodes) >= 1 and len(self.ce.relief_nodes) >= 1
         has_roads = len(self.roads) >= 12
 
         if has_nodes and has_facilities and has_roads:
-            level = "HIGH"
+            measured_level = "HIGH"
+        elif has_facilities and (has_nodes or has_roads):
+            measured_level = "MEDIUM"
+        else:
+            measured_level = "LOW"
+
+        # Measured completeness is strictly authoritative.
+        # If an explicit level is supplied that disagrees with measured completeness,
+        # resolve using measured completeness thresholds/logic.
+        selected_level = measured_level
+
+        if selected_level == "HIGH":
             badge_color = "green"
             explanation = (
                 "Topology graph, facility dependencies, and population cluster registries are 100% complete. "
                 "Deterministic counterfactual model produces exact graph simulation results."
             )
-        else:
-            level = "MEDIUM"
-            badge_color = "orange"
-            explanation = "Partial network coverage. Recommendations should be verified with field reconnaissance."
-
-        return {
-            "level": level,
-            "badge_color": badge_color,
-            "explanation": explanation,
-            "label": "Prototype analysis reliability — not a calibrated probability.",
-            "metrics": {
+            metrics = {
                 "Network Completeness": "100% (Synthetic Urban Graph)",
                 "Facility Dependency Model": "100% (Trauma Hospital + Relief Logistics)",
                 "Intervention Candidate Coverage": "Multi-Modal (Restoration + Temporary + Combined)",
             }
+        elif selected_level == "MEDIUM":
+            badge_color = "orange"
+            explanation = "Partial network coverage. Recommendations should be verified with field reconnaissance."
+            metrics = {
+                "Network Completeness": "Partial (<100% Urban Graph)",
+                "Facility Dependency Model": "100% (Trauma Hospital + Relief Logistics)" if has_facilities else "Partial (Degraded Facilities)",
+                "Intervention Candidate Coverage": "Restricted (Reduced Candidate Set)",
+            }
+        else:
+            selected_level = "LOW"
+            badge_color = "red"
+            explanation = "Insufficient network or facility coverage for reliable counterfactual optimization."
+            metrics = {
+                "Network Completeness": "Low (<50% Urban Graph)",
+                "Facility Dependency Model": "Incomplete (Missing Critical Facilities)",
+                "Intervention Candidate Coverage": "Limited (Minimal Candidate Set)",
+            }
+
+        return {
+            "level": selected_level,
+            "badge_color": badge_color,
+            "explanation": explanation,
+            "label": "Prototype analysis reliability — not a calibrated probability.",
+            "metrics": metrics,
         }
 

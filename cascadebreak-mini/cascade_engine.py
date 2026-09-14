@@ -24,11 +24,50 @@ from typing import Dict, List, Tuple, Any, Optional
 import networkx as nx
 
 
+def is_road_impassable(r: Dict[str, Any]) -> bool:
+    """
+    Shared passability contract for road definitions across CascadeEngine and InterventionEngine.
+    Returns True if the road is deemed impassable, False otherwise.
+
+    Supported impassability indicators:
+      - is_flooded is True
+      - is_accessible is False
+      - is_impassable is True
+      - passable / is_passable is False
+      - status in {"impassable", "submerged", "closed", "blocked"}
+    """
+    if not isinstance(r, dict):
+        return True
+    if r.get("is_flooded", False) is True:
+        return True
+    if r.get("is_accessible", True) is False:
+        return True
+    if r.get("is_impassable", False) is True:
+        return True
+    if r.get("passable") is False or r.get("is_passable") is False:
+        return True
+    status = str(r.get("status", "")).strip().lower()
+    if status in {"impassable", "submerged", "closed", "blocked"}:
+        return True
+    return False
+
+
+def is_road_passable(r: Dict[str, Any]) -> bool:
+    """
+    Returns True if the road is passable according to the shared passability contract.
+    """
+    return not is_road_impassable(r)
+
+
 class CascadeEngine:
     """
-    Manages the urban network graph, quantifies cascade disruption metrics,
+    Simulates disaster cascade effects on urban multi-modal infrastructure
     and provides non-destructive graph simulation interfaces.
     """
+
+    # Expose shared passability contract as class attributes
+    is_road_impassable = staticmethod(is_road_impassable)
+    is_road_passable = staticmethod(is_road_passable)
 
     def __init__(self, nodes: Dict[str, Dict[str, Any]], roads: List[Dict[str, Any]]):
         self.nodes = copy.deepcopy(nodes)
@@ -55,7 +94,7 @@ class CascadeEngine:
     ) -> nx.Graph:
         """
         Constructs a NetworkX Graph from nodes and road definitions.
-        If filter_flooded is True, flooded roads are excluded from the topology.
+        If filter_flooded is True, all impassable roads are excluded from the topology.
         """
         G = nx.Graph()
 
@@ -66,7 +105,7 @@ class CascadeEngine:
         # Add regular roads
         road_list = custom_roads if custom_roads is not None else self.roads
         for r in road_list:
-            if filter_flooded and r.get("is_flooded", False):
+            if filter_flooded and self.is_road_impassable(r):
                 continue
             G.add_edge(
                 r["u"],
