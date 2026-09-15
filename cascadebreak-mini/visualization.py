@@ -1,13 +1,84 @@
-﻿"""
+"""
 CascadeBreak AI - Geospatial & Network Visualization Module (V2)
 ================================================================
 Generates dark-themed climate-tech GIS maps for baseline flooded state,
 counterfactual intervention states, and Before vs After comparison views.
 """
 
-from typing import Dict, List, Any, Optional
+import warnings
+from typing import Dict, List, Any, Optional, Tuple
 import folium
 from folium.features import DivIcon
+
+# CARTO Dark Matter Tile configuration
+CARTO_DARK_MATTER_URL = "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png"
+CARTO_ATTRIBUTION = (
+    '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors '
+    '&copy; <a href="https://carto.com/attributions">CARTO</a>'
+)
+
+
+def get_carto_api_key() -> Optional[str]:
+    """
+    Safely retrieves the CARTO API key from Streamlit secrets without crashing
+    if secrets are unconfigured, empty, or if Streamlit is not installed/running.
+
+    Never prints, logs, or exposes the key value.
+    """
+    try:
+        import streamlit as st
+        # Safely access st.secrets using get("CARTO_API_KEY")
+        # st.secrets may raise StreamlitSecretNotFoundError (subclass of FileNotFoundError)
+        # if secrets.toml does not exist.
+        if hasattr(st, "secrets"):
+            key = st.secrets.get("CARTO_API_KEY")
+            if key and isinstance(key, str) and key.strip():
+                return key.strip()
+    except Exception:
+        # Gracefully handle missing or inaccessible secrets
+        pass
+    return None
+
+
+def get_carto_tile_url(api_key: Optional[str] = None) -> Tuple[str, bool]:
+    """
+    Constructs the CARTO Dark Matter tile URL.
+    Appends '?key=<API_KEY>' when a valid key is provided or found in Streamlit secrets.
+    If the secret is missing, returns the unauthenticated tile URL and indicates missing key.
+
+    Returns:
+        (tile_url: str, has_key: bool)
+    """
+    key = api_key if isinstance(api_key, str) and api_key.strip() else get_carto_api_key()    if key and isinstance(key, str) and key.strip():
+    return f"{CARTO_DARK_MATTER_URL}?key={key.strip()}", True
+    return CARTO_DARK_MATTER_URL, False
+
+
+def _notify_missing_carto_key() -> None:
+    """Displays a clear message when CARTO_API_KEY is not configured, without crashing."""
+    try:
+        import streamlit as st
+        # Only notify once per session if session_state is available
+        if hasattr(st, "session_state"):
+            if not st.session_state.get("_carto_key_warning_shown", False):
+                st.session_state["_carto_key_warning_shown"] = True
+                st.warning(
+                    "CARTO Dark Matter API key (`CARTO_API_KEY`) was not found in Streamlit Secrets. "
+                    "Basemap tiles may display an 'API KEY REQUIRED' notice. "
+                    "Add `CARTO_API_KEY = \"...\"` to `.streamlit/secrets.toml` to authorize CARTO basemap tiles."
+                )
+        elif hasattr(st, "warning"):
+            st.warning(
+                "CARTO Dark Matter API key (`CARTO_API_KEY`) was not found in Streamlit Secrets. "
+                "Basemap tiles may display an 'API KEY REQUIRED' notice. "
+                "Add `CARTO_API_KEY = \"...\"` to `.streamlit/secrets.toml` to authorize CARTO basemap tiles."
+            )
+    except Exception:
+        pass
+    warnings.warn(
+        "CARTO_API_KEY not found in Streamlit secrets. "
+        "Rendering CARTO Dark Matter basemap without API key authorization."
+    )
 
 
 def create_network_map(
@@ -17,6 +88,7 @@ def create_network_map(
     title: str = "Urban Road Network",
     highlight_roads: Optional[List[str]] = None,
     extra_edges: Optional[List[Dict[str, Any]]] = None,
+    api_key: Optional[str] = None,
 ) -> folium.Map:
     """
     Creates a dark tactical GIS Folium map representing the network state.
@@ -26,17 +98,30 @@ def create_network_map(
       - Red (#EF4444): Flooded / Impassable Road (Dashed)
       - Cyan (#22D3EE): Restored / Selected Intervention / Tactical Bypass (Bold)
       - Amber (#F59E0B): Partial Access / Warning
-      - Basemap: CartoDB dark_matter
+      - Basemap: CartoDB Dark Matter (authenticated with CARTO_API_KEY)
     """
     avg_lat = sum(n["lat"] for n in nodes.values()) / len(nodes)
     avg_lon = sum(n["lon"] for n in nodes.values()) / len(nodes)
 
+    tile_url, has_key = get_carto_tile_url(api_key=api_key)
+    if not has_key:
+        _notify_missing_carto_key()
+
     m = folium.Map(
         location=[avg_lat, avg_lon],
         zoom_start=12,
-        tiles="CartoDB dark_matter",
+        tiles=None,
         control_scale=True,
     )
+
+    folium.TileLayer(
+        tiles=tile_url,
+        attr=CARTO_ATTRIBUTION,
+        name="CartoDB dark_matter",
+        subdomains="abcd",
+        max_zoom=20,
+        control=False,
+    ).add_to(m)
 
     highlight_set = set(highlight_roads or [])
 
