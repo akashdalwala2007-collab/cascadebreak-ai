@@ -142,7 +142,10 @@ class InterventionEngine:
                 # 2. Critical facility connectivity: connects directly to hospital or relief centre
                 connects_facility = bool({r1["u"], r1["v"], r2["u"], r2["v"]} & fac_nodes)
                 # 3. Population exposure: total population across distinct endpoints
-                pop_weight = sum(self.nodes[n].get("population", 0) for n in {r1["u"], r1["v"], r2["u"], r2["v"]})
+                pop_weight = sum(
+                    self.nodes.get(n, {}).get("population", 0)
+                    for n in {r1["u"], r1["v"], r2["u"], r2["v"]}
+                )
                 # 4. Logistical feasibility: lower combined effort is preferred
                 combined_effort = round(r1["effort_cost"] + r2["effort_cost"], 1)
 
@@ -258,7 +261,7 @@ class InterventionEngine:
             if r["road_id"] in target_roads_set:
                 r["is_flooded"] = False
                 r["is_accessible"] = True
-                r["is_impassable"] = False
+                if "status" in r and str(r["status"]).strip().lower() in {"impassable", "submerged", "closed", "blocked"}:
                 r["passable"] = True
                 r["is_passable"] = True
                 if "status" in r and str(r["status"]).lower() in {"impassable", "submerged", "closed", "blocked"}:
