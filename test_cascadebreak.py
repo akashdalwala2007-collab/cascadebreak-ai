@@ -168,7 +168,19 @@ def test_carto_dark_matter_basemap_api_key_integration():
         assert tile_layers[0].options["max_zoom"] == 20
         assert "CARTO" in tile_layers[0].options["attribution"]
 
-    # 2. Test explicit api_key override
+    # 2. Test key formats and variants (lowercase, section, env var, quotes)
+    import os
+    with patch.object(st, "secrets", {"carto_api_key": "lower_key_1"}):
+        assert get_carto_api_key() == "lower_key_1"
+    with patch.object(st, "secrets", {"carto": {"api_key": "section_key_2"}}):
+        assert get_carto_api_key() == "section_key_2"
+    with patch.object(st, "secrets", {"CARTO_API_KEY": '"quoted_key_3"'}):
+        assert get_carto_api_key() == "quoted_key_3"
+    with patch.object(st, "secrets", {}):
+        with patch.dict(os.environ, {"CARTO_API_KEY": "env_key_4"}):
+            assert get_carto_api_key() == "env_key_4"
+
+    # 3. Test explicit api_key override
     explicit_key = "explicit_custom_key_456"
     tile_url_exp, has_key_exp = get_carto_tile_url(api_key=explicit_key)
     assert has_key_exp is True

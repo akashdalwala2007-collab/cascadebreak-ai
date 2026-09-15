@@ -20,23 +20,66 @@ CARTO_ATTRIBUTION = (
 
 def get_carto_api_key() -> Optional[str]:
     """
-    Safely retrieves the CARTO API key from Streamlit secrets without crashing
-    if secrets are unconfigured, empty, or if Streamlit is not installed/running.
+    Safely retrieves the CARTO API key from Streamlit secrets (or environment variables)
+    without crashing if secrets are unconfigured, empty, or if Streamlit is not running.
+
+    Supports:
+      - st.secrets.get("CARTO_API_KEY")
+      - Case-insensitive lookup in st.secrets (e.g. carto_api_key, CARTO_API_KEY)
+      - TOML table/sectioned lookup (e.g. [carto] api_key = "...")
+      - os.environ fallback (CARTO_API_KEY, carto_api_key)
+      - Strips surrounding quotes and whitespace
 
     Never prints, logs, or exposes the key value.
     """
+    # 1. Try Streamlit secrets
     try:
         import streamlit as st
-        # Safely access st.secrets using get("CARTO_API_KEY")
-        # st.secrets may raise StreamlitSecretNotFoundError (subclass of FileNotFoundError)
-        # if secrets.toml does not exist.
         if hasattr(st, "secrets"):
-            key = st.secrets.get("CARTO_API_KEY")
-            if key and isinstance(key, str) and key.strip():
-                return key.strip()
+            # Direct exact key lookup
+            val = st.secrets.get("CARTO_API_KEY")
+            if val and isinstance(val, str) and val.strip().strip("'\""):
+                return val.strip().strip("'\"")
+
+            val = st.secrets.get("carto_api_key")
+            if val and isinstance(val, str) and val.strip().strip("'\""):
+                return val.strip().strip("'\"")
+
+            # Check nested sections like [carto] api_key = "..."
+            for sec_name in ("carto", "CARTO", "Carto"):
+                try:
+                    sec = st.secrets.get(sec_name)
+                    if isinstance(sec, dict):
+                        for k in ("api_key", "API_KEY", "key", "KEY", "carto_api_key", "CARTO_API_KEY"):
+                            v = sec.get(k)
+                            if v and isinstance(v, str) and v.strip().strip("'\""):
+                                return v.strip().strip("'\"")
+                except Exception:
+                    pass
+
+            # Case-insensitive scan of top-level mapping
+            try:
+                for k in st.secrets:
+                    if str(k).strip().lower() in ("carto_api_key", "carto_key"):
+                        v = st.secrets[k]
+                        if v and isinstance(v, str) and v.strip().strip("'\""):
+                            return v.strip().strip("'\"")
+            except Exception:
+                pass
     except Exception:
         # Gracefully handle missing or inaccessible secrets
         pass
+
+    # 2. Try environment variables (fallback for container / PaaS deployments)
+    try:
+        import os
+        for env_var in ("CARTO_API_KEY", "carto_api_key", "CARTO_KEY", "carto_key"):
+            val = os.environ.get(env_var)
+            if val and isinstance(val, str) and val.strip().strip("'\""):
+                return val.strip().strip("'\"")
+    except Exception:
+        pass
+
     return None
 
 
@@ -49,8 +92,10 @@ def get_carto_tile_url(api_key: Optional[str] = None) -> Tuple[str, bool]:
     Returns:
         (tile_url: str, has_key: bool)
     """
-    key = api_key if isinstance(api_key, str) and api_key.strip() else get_carto_api_key()    if key and isinstance(key, str) and key.strip():
-        return f"{CARTO_DARK_MATTER_URL}?key={key.strip()}", True
+    key = api_key if (isinstance(api_key, str) and api_key.strip()) else get_carto_api_key()
+    if key and isinstance(key, str) and key.strip():
+        cleaned_key = key.strip().strip("'\"")
+        return f"{CARTO_DARK_MATTER_URL}?key={cleaned_key}", True
     return CARTO_DARK_MATTER_URL, False
 
 
